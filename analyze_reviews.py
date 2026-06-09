@@ -1,126 +1,231 @@
 import pandas as pd
 import json
 import os
+import re
 from openai import OpenAI
+import tkinter as tk
+from tkinter import filedialog
 
 # ================== 配置 ==================
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
-CSV_FILE_PATH = r"C:\Users\21401\Desktop\AI产品经理求职_Dx\02_作品集\多邻国用户情感分析\duolingo_reviews.csv"
-OUTPUT_DIR = r"C:\Users\21401\Desktop\AI产品经理求职_Dx\03_输出结果\多邻国用户情感分析输出结果"
+if not DEEPSEEK_API_KEY:
+    DEEPSEEK_API_KEY = "sk-1d15abb86fc24802b13f74e92a2cc9be"
 
+print("="*60)
+print("多邻国评论情感分析系统")
+print("="*60)
+print("\n📂 请选择评论CSV文件...")
+
+root = tk.Tk()
+root.withdraw()
+CSV_FILE_PATH = filedialog.askopenfilename(
+    title="选择评论CSV文件",
+    filetypes=[("CSV文件", "*.csv")]
+)
+if not CSV_FILE_PATH:
+    print("❌ 未选择文件")
+    exit()
+print(f"✅ 已选择: {CSV_FILE_PATH}")
+
+OUTPUT_DIR = os.path.dirname(CSV_FILE_PATH) + "_output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
 client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
 
-print("="*60)
-print("多邻国评论情感分析系统 (最终版)")
-print("="*60)
-# ================== 1. 精确提取评论 ==================
-def extract_comments_precise(file_path):
-    """根据你的文件结构精确提取"""
+# ================== 自动识别提取 ==================
+def extract_comments_auto(file_path):
+    """纯自动识别 - 不针对任何特定格式"""
     
     # 读取文件
     try:
         df = pd.read_csv(file_path, encoding='utf-8')
-        print("✅ 读取成功 (UTF-8)")
+        encoding_used = 'utf-8'
     except:
-        df = pd.read_csv(file_path, encoding='gbk')
-        print("✅ 读取成功 (GBK)")
+        try:
+            df = pd.read_csv(file_path, encoding='gbk')
+            encoding_used = 'gbk'
+        except:
+            try:
+                df = pd.read_csv(file_path, encoding='utf-8-sig')
+                encoding_used = 'utf-8-sig'
+            except:
+                df = pd.read_csv(file_path, encoding='latin1')
+                encoding_used = 'latin1'
     
+    print(f"✅ 读取成功 (编码: {encoding_used})")
     print(f"📄 文件形状: {df.shape[0]}行 x {df.shape[1]}列")
     print(f"📋 列名: {list(df.columns)}")
     
+    # ========== 自动识别每一列的类型 ==========
+    def guess_column_type(col_name, sample_values):
+        """根据列名和样本值猜测列类型"""
+        col_lower = str(col_name).lower().strip()
+        
+        # 评论文本列
+        text_keywords = ['内容', 'text', 'review', '评论', 'comment', 'content', '评价', '正文']
+        for kw in text_keywords:
+            if kw in col_lower:
+                return 'text'
+        
+        # 用户名列
+        user_keywords = ['作者', 'user', 'name', '用户名', 'username', 'author', '昵称', '发表人']
+        for kw in user_keywords:
+            if kw in col_lower:
+                return 'user'
+            # 如果列名是纯数字或包含'id'，跳过
+        if 'id' in col_lower or col_lower.isdigit():
+          return 'unknown'
+        
+        # 评分列
+        score_keywords = ['评分', 'score', '星级', 'rating', '评级', 'star', '打分']
+        for kw in score_keywords:
+            if kw in col_lower:
+                return 'score'
+        
+        # 标题列
+        title_keywords = ['标题', 'title', '主题', 'subject']
+        for kw in title_keywords:
+            if kw in col_lower:
+                return 'title'
+        
+        # 日期列
+        date_keywords = ['时间', 'date', '发表时间', 'created', '发布时间']
+        for kw in date_keywords:
+            if kw in col_lower:
+                return 'date'
+        
+        # 如果列名不匹配，根据样本值猜测
+        if len(sample_values) > 0:
+            sample_str = str(sample_values[0]) if pd.notna(sample_values[0]) else ""
+            # 如果是纯数字1-5，可能是评分
+            if sample_str.isdigit() and int(sample_str) in [1,2,3,4,5]:
+                return 'score'
+            # 如果长度较长(>20)，可能是评论文本
+            if len(sample_str) > 20:
+                return 'text'
+            # 如果长度适中(3-15)，可能是用户名
+            if 3 <= len(sample_str) <= 15:
+                return 'user'
+        
+        return 'unknown'
+    
+    # 获取每列的样本值（前10个非空值）
+    column_samples = {}
+    for col in df.columns:
+        samples = df[col].dropna().head(10).tolist()
+        column_samples[col] = [str(s) for s in samples if str(s) not in ['nan', 'None', '']]
+    
+    # 猜测每列的类型
+    column_types = {}
+    for col in df.columns:
+        col_type = guess_column_type(col, column_samples.get(col, []))
+        column_types[col] = col_type
+    
+    print(f"\n🔍 自动识别结果:")
+    for col, ctype in column_types.items():
+        if ctype != 'unknown':
+            print(f"   {col} → {ctype}")
+    
+    # 找出各类型对应的列
+    text_cols = [col for col, typ in column_types.items() if typ == 'text']
+    user_cols = [col for col, typ in column_types.items() if typ == 'user']
+    score_cols = [col for col, typ in column_types.items() if typ == 'score']
+    
+    # 如果有多个，取第一个
+    text_col = text_cols[0] if text_cols else None
+    user_col = user_cols[0] if user_cols else None
+    score_col = score_cols[0] if score_cols else None
+    
+    print(f"\n📌 最终采用:")
+    print(f"   评论文本列: {text_col if text_col else '未识别'}")
+    print(f"   用户名列: {user_col if user_col else '未识别'}")
+    print(f"   评分列: {score_col if score_col else '未识别'}")
+    
+    # ========== 提取评论 ==========
     comments = []
     
     # 遍历每一行
     for idx, row in df.iterrows():
-        # 尝试多种方式提取评论
-        
-        # 方式1：如果有'内容'列（表格2）
-        if '内容' in df.columns:
-            comment = str(row['内容']).strip() if pd.notna(row['内容']) else ""
-            if len(comment) >= 3 and comment not in ['nan', 'None', '']:
-                # 用户名：从'作者'列获取
-                user_name = str(row['作者']).strip() if '作者' in df.columns and pd.notna(row['作者']) else "未知用户"
-                # 评分：从'评级'列获取
-                score = 3
-                if '评级' in df.columns and pd.notna(row['评级']):
-                    score_str = str(row['评级']).strip()
-                    digits = ''.join(filter(str.isdigit, score_str))
+        try:
+            # 提取文本
+            comment = ""
+            if text_col and pd.notna(row[text_col]):
+                comment = str(row[text_col]).strip()
+            
+            # 如果没有识别到文本列，尝试所有列找最长的字符串
+            if not comment or len(comment) < 5:
+                for col in df.columns:
+                    if pd.notna(row[col]):
+                        val = str(row[col]).strip()
+                        if len(val) > len(comment) and len(val) >= 10:
+                            comment = val
+            
+            if not comment or len(comment) < 3:
+                continue
+            
+            # 提取用户名
+            user_name = "匿名用户"
+            if user_col and pd.notna(row[user_col]):
+                user_name = str(row[user_col]).strip()
+                if user_name.lower() in ['nan', 'none', '']:
+                    user_name = "匿名用户"
+            else:
+                # 尝试找短字段作为用户名
+                for col in df.columns:
+                    if pd.notna(row[col]):
+                        val = str(row[col]).strip()
+                        if 2 <= len(val) <= 20 and val not in [comment, user_name]:
+                            user_name = val
+                            break
+            
+            # 提取评分
+            score = 3
+            if score_col and pd.notna(row[score_col]):
+                try:
+                    score_str = str(row[score_col]).strip()
+                    digits = re.findall(r'\d+', score_str)
                     if digits:
                         score = int(digits[0])
                         if score > 5:
                             score = 5
-                
-                comments.append({
-                    'userName': user_name,
-                    'score': score,
-                    'text': comment
-                })
-                continue
-        
-        # 方式2：如果有'text'列（表格1）
-        if 'text' in df.columns:
-            comment = str(row['text']).strip() if pd.notna(row['text']) else ""
-            if len(comment) >= 3 and comment not in ['nan', 'None', '']:
-                user_name = str(row['userName']).strip() if 'userName' in df.columns and pd.notna(row['userName']) else "未知用户"
-                score = 3
-                if 'score' in df.columns and pd.notna(row['score']):
-                    score_str = str(row['score']).strip()
-                    digits = ''.join(filter(str.isdigit, score_str))
-                    if digits:
-                        score = int(digits[0])
-                        if score > 5:
-                            score = 5
-                
-                comments.append({
-                    'userName': user_name,
-                    'score': score,
-                    'text': comment
-                })
-                continue
-        
-        # 方式3：如果都没有，尝试按位置提取
-        # 把行转为列表
-        row_list = list(row)
-        if len(row_list) >= 5:
-            # 第5列（索引4）通常是评论内容
-            comment = str(row_list[4]).strip() if len(row_list) > 4 else ""
-            if len(comment) >= 3 and comment not in ['nan', 'None', '']:
-                # 第2列（索引1）是用户名
-                user_name = str(row_list[1]).strip() if len(row_list) > 1 else "未知用户"
-                # 第3列（索引2）是评分
-                score = 3
-                score_str = str(row_list[2]).strip() if len(row_list) > 2 else ""
-                digits = ''.join(filter(str.isdigit, score_str))
-                if digits:
-                    score = int(digits[0])
-                    if score > 5:
-                        score = 5
-                
-                comments.append({
-                    'userName': user_name,
-                    'score': score,
-                    'text': comment
-                })
+                except:
+                    pass
+            else:
+                # 尝试找1-5的数字作为评分
+                for col in df.columns:
+                    if pd.notna(row[col]):
+                        val = str(row[col]).strip()
+                        if val.isdigit() and 1 <= int(val) <= 5:
+                            score = int(val)
+                            break
+            
+            comments.append({
+                'userName': user_name,
+                'score': score,
+                'text': comment
+            })
+        except Exception as e:
+            continue
     
     # 去重
     unique = []
     seen = set()
     for c in comments:
-        if c['text'][:50] not in seen:
-            seen.add(c['text'][:50])
+        key = c['text'][:80]
+        if key not in seen:
+            seen.add(key)
             unique.append(c)
     
-    print(f"✅ 共提取 {len(unique)} 条有效评论")
+    print(f"\n✅ 共提取 {len(unique)} 条有效评论")
     
-    # 显示前5条示例
-    print("\n📝 前5条示例:")
-    for i, c in enumerate(unique[:5]):
-        print(f"   {i+1}. {c['userName']} ({c['score']}星): {c['text'][:40]}...")
+    if len(unique) > 0:
+        print("\n📝 前5条示例:")
+        for i, c in enumerate(unique[:5]):
+            print(f"   {i+1}. {c['userName']} ({c['score']}星): {c['text'][:50]}...")
     
     return unique
 
-# ================== 2. 分析评论 ==================
+# ================== 分析评论 ==================
 def analyze_comment(user_name, score, text):
     prompt = f"""分析这条用户评论：
 用户：{user_name}
@@ -141,9 +246,9 @@ def analyze_comment(user_name, score, text):
     result['comment_preview'] = text[:80]
     return result
 
-# ================== 3. 主程序 ==================
-print("\n🔍 步骤1: 提取评论...")
-comments = extract_comments_precise(CSV_FILE_PATH)
+# ================== 主程序 ==================
+print("\n🔍 步骤1: 自动识别并提取评论...")
+comments = extract_comments_auto(CSV_FILE_PATH)
 
 if len(comments) == 0:
     print("❌ 没有找到评论！")
@@ -169,7 +274,7 @@ for i, c in enumerate(comments):
             'comment_preview': c['text'][:80]
         })
 
-# 保存CSV
+# 保存结果
 df = pd.DataFrame(results)
 csv_path = os.path.join(OUTPUT_DIR, "完整分析结果.csv")
 df.to_csv(csv_path, index=False, encoding='utf-8-sig')
@@ -197,44 +302,6 @@ urgent = df.sort_values('urgency', ascending=False).head(5)
 for i, row in urgent.iterrows():
     print(f"   [{row['urgency']}分] {row['issue'][:55]}")
 
-# 生成图表
-try:
-    import matplotlib.pyplot as plt
-    import matplotlib
-    matplotlib.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei']
-    matplotlib.rcParams['axes.unicode_minus'] = False
-    
-    # 饼图
-    plt.figure(figsize=(10, 5))
-    
-    plt.subplot(1, 2, 1)
-    colors = {'正面': '#4CAF50', '负面': '#F44336', '中性': '#FFC107'}
-    pie_colors = [colors.get(s, '#999999') for s in sentiment_counts.index]
-    wedges, texts, autotexts = plt.pie(sentiment_counts.values, labels=sentiment_counts.index, 
-                                        autopct='%1.1f%%', colors=pie_colors)
-    plt.title(f'情感分布\n(共{len(df)}条)')
-    
-    # 柱状图
-    plt.subplot(1, 2, 2)
-    score_counts = df['score'].value_counts().sort_index()
-    bars = plt.bar(score_counts.index.astype(str), score_counts.values, 
-                   color=['#F44336', '#FF9800', '#FFC107', '#8BC34A', '#4CAF50'])
-    plt.xlabel('评分')
-    plt.ylabel('数量')
-    plt.title('评分分布')
-    for bar, v in zip(bars, score_counts.values):
-        plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1, str(v), ha='center')
-    
-    plt.tight_layout()
-    chart_path = os.path.join(OUTPUT_DIR, "分析图表.png")
-    plt.savefig(chart_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"\n📊 图表已保存: {chart_path}")
-    
-except Exception as e:
-    print(f"图表生成失败: {e}")
-
 print("\n" + "="*60)
 print("✅ 完成！")
-print(f"   结果文件: {csv_path}")
 print("="*60)
