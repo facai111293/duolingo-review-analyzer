@@ -9,7 +9,7 @@ from tkinter import filedialog
 # ================== 配置 ==================
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 if not DEEPSEEK_API_KEY:
-    DEEPSEEK_API_KEY = "sk-1d15abb86fc24802b13f74e92a2cc9be"
+    DEEPSEEK_API_KEY = ""
 
 print("="*60)
 print("多邻国评论情感分析系统")
